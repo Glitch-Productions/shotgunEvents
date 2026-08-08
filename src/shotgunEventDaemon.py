@@ -281,7 +281,15 @@ class Engine(object):
             rootLogger = logging.getLogger()
             rootLogger.config = self.config
             _setFilePathOnLogger(rootLogger, self.config.getLogFile())
-            print(self.config.getLogFile())
+            # Root is the sink for everything that isn't `engine`, `timing`,
+            # or a `plugin.*` logger -- notably every library a plugin
+            # imports, which logs to its own module logger. Without a level
+            # here root keeps Python's default WARNING, so those libraries
+            # are silently demoted to warnings-only: their `info`/`debug`
+            # records fail `isEnabledFor` and are never even created. The
+            # handler above would have emitted them; the missing level is
+            # what dropped them.
+            rootLogger.setLevel(self.config.getLogLevel())
 
             # Set the engine logger for email output.
             self.log = logging.getLogger("engine")

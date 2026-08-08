@@ -34,6 +34,14 @@ logFile: shotgunEventDaemon
 # - 30 - Warnings
 # - 40 - Error
 # - 50 - Critical
+#
+# Under logMode 0 this level is also applied to the root logger, so it governs
+# any library a plugin imports as well -- those log to their own module
+# loggers, which inherit from root. Previously root kept Python's default of
+# WARNING, so library info/debug records were never created even though the
+# root file handler would have written them. Note that 10 (Debug) is therefore
+# considerably more verbose than it used to be: it takes every imported
+# library down to debug too, not just the daemon.
 logging: 20
 
 # Enable Timing logging
