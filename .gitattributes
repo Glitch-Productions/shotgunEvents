@@ -1,0 +1,14 @@
+# Normalize text files to LF in the repository and on checkout.
+#
+# Without this, a Windows editor rewrites whole files to CRLF and every
+# line reads as modified -- 57 files at once here, which buries real
+# changes and makes a one-line fix indistinguishable from a rewrite.
+# `eol=lf` is deliberate rather than plain `text=auto`: the daemon runs
+# on Linux, so a CRLF working copy would also break the shebang.
+* text=auto eol=lf
+
+# Binary assets -- never convert. `text=auto` detects these on its own,
+# but being explicit stops a heuristic miss from corrupting them.
+*.gif binary
+*.png binary
+*.jpg binary
