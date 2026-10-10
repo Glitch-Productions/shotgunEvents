@@ -1,0 +1,9 @@
+# Packages needed to run the tests in tests/:
+#
+#     pip install -r requirements-dev.txt
+#     python -m pytest tests
+#
+# Use Python 3.11: the daemon still imports imp and distutils, which Python
+# 3.12 removed.
+pytest
+shotgun_api3

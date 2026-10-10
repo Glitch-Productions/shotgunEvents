@@ -60,6 +60,9 @@ from shotgun_api3.lib.sgtimezone import SgTimezone
 
 SG_TIMEZONE = SgTimezone()
 
+# Largest number of backlogged event ids fetched by a single "in" query.
+BACKLOG_FETCH_CHUNK_SIZE = 100
+
 EMAIL_FORMAT_STRING = """Time: %(asctime)s
 Logger: %(name)s
 Path: %(pathname)s
@@ -502,15 +505,19 @@ class Engine(object):
         self.log.debug("Starting the event processing loop.")
         while self._continue:
             # Process events
+            nextEventId = self._getNextUnprocessedEventId()
             events = self._getNewEvents()
             for event in events:
                 for collection in self._pluginCollections:
                     collection.process(event)
                 self._saveEventIdData()
 
+            for collection in self._pluginCollections:
+                collection.logTooOldEvents()
+
             # if we're lagging behind Shotgun, we received a full batch of events
             # skip the sleep() call in this case
-            if len(events) < self.config.getMaxEventBatchSize():
+            if not self._isLagging(nextEventId, events):
                 time.sleep(self._fetch_interval)
 
             # Reload plugins
@@ -525,12 +532,14 @@ class Engine(object):
     def stop(self):
         self._continue = False
 
-    def _getNewEvents(self):
+    def _getNextUnprocessedEventId(self):
         """
-        Fetch new events from Shotgun.
+        Get the id of the first event no active plugin has processed yet.
 
-        @return: Recent events that need to be processed by the engine.
-        @rtype: I{list} of Flow Production Tracking event dictionaries.
+        Backlogged ids are not taken into account, see L{_getNewEvents}.
+
+        @return: The event id, or None if no plugin has processed any event.
+        @rtype: I{int} or None
         """
         nextEventId = None
         for newId in [
@@ -538,49 +547,120 @@ class Engine(object):
         ]:
             if newId is not None and (nextEventId is None or newId < nextEventId):
                 nextEventId = newId
+        return nextEventId
 
+    def _isLagging(self, nextEventId, events):
+        """
+        Check if a pass fetched a full batch of new events and processed them.
+
+        Only then is the engine behind Flow Production Tracking and should
+        fetch again without waiting. A full batch that did not move the last
+        processed event id forward must not skip the wait, or the loop spins.
+
+        @param nextEventId: The next unprocessed event id before the pass.
+        @type nextEventId: I{int} or None
+        @param events: The events fetched by the pass.
+        @type events: I{list} of Flow Production Tracking event dictionaries.
+        """
+        if nextEventId is None:
+            return False
+
+        newEvents = [event for event in events if event["id"] >= nextEventId]
+        if len(newEvents) < self.config.getMaxEventBatchSize():
+            return False
+
+        newNextEventId = self._getNextUnprocessedEventId()
+        return newNextEventId is not None and newNextEventId > nextEventId
+
+    def _getNewEvents(self):
+        """
+        Fetch new events from Shotgun.
+
+        Two sets of events are fetched: up to max_event_batch_size events that
+        follow the last processed one, and the backlogged events, by id. An
+        event id gap therefore no longer makes every pass fetch again all the
+        events from the oldest backlogged id onward.
+
+        @return: Recent events that need to be processed by the engine, sorted
+            by id.
+        @rtype: I{list} of Flow Production Tracking event dictionaries.
+        """
+        # Save at once when backlogged ids expired: the state is reloaded from
+        # disk at the end of every pass and would bring them back.
+        if sum([coll.pruneBacklog() for coll in self._pluginCollections]):
+            self._saveEventIdData()
+
+        events = []
+        nextEventId = self._getNextUnprocessedEventId()
         if nextEventId is not None:
             filters = [["id", "greater_than", nextEventId - 1]]
-            fields = [
-                "id",
-                "event_type",
-                "attribute_name",
-                "meta",
-                "entity",
-                "user",
-                "project",
-                "session_uuid",
-                "created_at",
+            events.extend(self._findEvents(filters, self.config.getMaxEventBatchSize()))
+
+        backlogIds = sorted(
+            set().union(
+                *[coll.getBacklogEventIds() for coll in self._pluginCollections]
+            )
+        )
+        for start in range(0, len(backlogIds), BACKLOG_FETCH_CHUNK_SIZE):
+            filters = [
+                ["id", "in", backlogIds[start : start + BACKLOG_FETCH_CHUNK_SIZE]]
             ]
-            order = [{"column": "id", "direction": "asc"}]
+            events.extend(self._findEvents(filters))
 
-            conn_attempts = 0
-            while True:
-                try:
-                    events = self._sg.find(
-                        "EventLogEntry",
-                        filters,
-                        fields,
-                        order,
-                        limit=self.config.getMaxEventBatchSize(),
-                    )
-                    if events:
-                        self.log.debug(
-                            "Got %d events: %d to %d.",
-                            len(events),
-                            events[0]["id"],
-                            events[-1]["id"],
-                        )
-                    return events
-                except (sg.ProtocolError, sg.ResponseError, socket.error) as err:
-                    conn_attempts = self._checkConnectionAttempts(
-                        conn_attempts, str(err)
-                    )
-                except Exception as err:
-                    msg = "Unknown error: %s" % str(err)
-                    conn_attempts = self._checkConnectionAttempts(conn_attempts, msg)
+        # An event can be new for one plugin and backlogged for another.
+        events = sorted(
+            {event["id"]: event for event in events}.values(),
+            key=lambda event: event["id"],
+        )
+        if events:
+            self.log.debug(
+                "Got %d events: %d to %d.",
+                len(events),
+                events[0]["id"],
+                events[-1]["id"],
+            )
+        return events
 
-        return []
+    def _findEvents(self, filters, limit=0):
+        """
+        Find events, retrying until the connection to Shotgun works.
+
+        @param filters: The Shotgun filters the events must match.
+        @type filters: I{list}
+        @param limit: The largest number of events to return, 0 for all.
+        @type limit: I{int}
+
+        @return: The matching events, sorted by id.
+        @rtype: I{list} of Flow Production Tracking event dictionaries.
+        """
+        fields = [
+            "id",
+            "event_type",
+            "attribute_name",
+            "meta",
+            "entity",
+            "user",
+            "project",
+            "session_uuid",
+            "created_at",
+        ]
+        order = [{"column": "id", "direction": "asc"}]
+
+        conn_attempts = 0
+        while True:
+            try:
+                return self._sg.find(
+                    "EventLogEntry",
+                    filters,
+                    fields,
+                    order,
+                    limit=limit,
+                )
+            except (sg.ProtocolError, sg.ResponseError, socket.error) as err:
+                conn_attempts = self._checkConnectionAttempts(conn_attempts, str(err))
+            except Exception as err:
+                msg = "Unknown error: %s" % str(err)
+                conn_attempts = self._checkConnectionAttempts(conn_attempts, msg)
 
     def _saveEventIdData(self):
         """
@@ -675,12 +755,26 @@ class PluginCollection(object):
                 eId = newId
         return eId
 
+    def getBacklogEventIds(self):
+        eIds = set()
+        for plugin in self:
+            if plugin.isActive():
+                eIds.update(plugin.getBacklogEventIds())
+        return eIds
+
+    def pruneBacklog(self):
+        return sum([plugin.pruneBacklog() for plugin in self if plugin.isActive()])
+
     def process(self, event):
         for plugin in self:
             if plugin.isActive():
                 plugin.process(event)
             else:
                 plugin.logger.debug("Skipping: inactive.")
+
+    def logTooOldEvents(self):
+        for plugin in self:
+            plugin.logTooOldEvents()
 
     def load(self):
         """
@@ -742,6 +836,12 @@ class Plugin(object):
         self._lastEventId = None
         self._backlog = {}
 
+        # Events of the current pass that were already processed, logged once
+        # per pass by logTooOldEvents().
+        self._tooOldCount = 0
+        self._tooOldFirstId = None
+        self._tooOldLastId = None
+
         # Setup the plugin's logger
         self.logger = logging.getLogger("plugin." + self.getName())
         self.logger.config = self._engine.config
@@ -767,21 +867,31 @@ class Plugin(object):
         return (self._lastEventId, self._backlog)
 
     def getNextUnprocessedEventId(self):
+        """
+        Get the id of the event that follows the last one processed.
+
+        Backlogged ids are not included, see L{getBacklogEventIds}.
+        """
         if self._lastEventId:
-            nextId = self._lastEventId + 1
-        else:
-            nextId = None
+            return self._lastEventId + 1
+        return None
 
+    def getBacklogEventIds(self):
+        return list(self._backlog)
+
+    def pruneBacklog(self):
+        """
+        Remove the backlogged ids whose timeout elapsed.
+
+        @return: The number of ids removed.
+        @rtype: I{int}
+        """
         now = datetime.datetime.now()
-        for k in list(self._backlog):
-            v = self._backlog[k]
-            if v < now:
-                self.logger.warning("Timeout elapsed on backlog event id %d.", k)
-                del self._backlog[k]
-            elif nextId is None or k < nextId:
-                nextId = k
-
-        return nextId
+        expiredIds = [k for k, v in self._backlog.items() if v < now]
+        for k in expiredIds:
+            self.logger.warning("Timeout elapsed on backlog event id %d.", k)
+            del self._backlog[k]
+        return len(expiredIds)
 
     def isActive(self):
         """
@@ -897,15 +1007,38 @@ class Plugin(object):
             if self._process(event):
                 self.logger.info("Processed id %d from backlog." % event["id"])
                 del self._backlog[event["id"]]
-                self._updateLastEventId(event)
+                # A late event is older than the last one processed. Moving the
+                # last processed id back to it would run every later event again.
+                if event["id"] > self._lastEventId:
+                    self._updateLastEventId(event)
         elif self._lastEventId is not None and event["id"] <= self._lastEventId:
-            msg = "Event %d is too old. Last event processed was (%d)."
-            self.logger.debug(msg, event["id"], self._lastEventId)
+            if self._tooOldCount == 0:
+                self._tooOldFirstId = event["id"]
+            self._tooOldCount += 1
+            self._tooOldLastId = event["id"]
         else:
             if self._process(event):
                 self._updateLastEventId(event)
 
         return self._active
+
+    def logTooOldEvents(self):
+        """
+        Log in one line the events of this pass that were already processed.
+        """
+        if self._tooOldCount:
+            msg = (
+                "Skipped %d too old event(s) (ids %d to %d). "
+                "Last event processed was (%d)."
+            )
+            self.logger.debug(
+                msg,
+                self._tooOldCount,
+                self._tooOldFirstId,
+                self._tooOldLastId,
+                self._lastEventId,
+            )
+        self._tooOldCount = 0
 
     def _process(self, event):
         for callback in self:
