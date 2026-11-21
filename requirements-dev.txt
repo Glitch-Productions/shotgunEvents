@@ -3,7 +3,7 @@
 #     pip install -r requirements-dev.txt
 #     python -m pytest tests
 #
-# Use Python 3.11: the daemon still imports imp and distutils, which Python
-# 3.12 removed.
+# Any Python from 3.10 to 3.13 works. Plugins load through importlib_wrapper,
+# not imp (shotgun-events #34).
 pytest
 shotgun_api3
